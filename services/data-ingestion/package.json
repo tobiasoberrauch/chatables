@@ -1,0 +1,41 @@
+{
+  "name": "@chatables/data-ingestion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Data ingestion service with multi-provider adapters for financial market data",
+  "main": "dist/ingestion-pipeline.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/ingestion-pipeline.js",
+    "dev": "ts-node src/ingestion-pipeline.ts",
+    "lint": "eslint src/ --ext .ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "ws": "^8.16.0",
+    "ioredis": "^5.3.2",
+    "pg": "^8.12.0",
+    "uuid": "^9.0.1",
+    "cron": "^3.1.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/node-fetch": "^2.6.11",
+    "@types/ws": "^8.5.10",
+    "@types/pg": "^8.10.9",
+    "@types/uuid": "^9.0.7",
+    "@types/cron": "^2.4.0",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2",
+    "vitest": "^2.1.5",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

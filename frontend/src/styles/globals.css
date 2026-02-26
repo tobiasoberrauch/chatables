@@ -1,0 +1,196 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/*  Base layer: dark-first terminal defaults                          */
+/* ------------------------------------------------------------------ */
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    @apply bg-terminal-bg text-terminal-text antialiased;
+    font-feature-settings: 'tnum' 1, 'cv01' 1;
+  }
+
+  body {
+    @apply min-h-screen font-sans text-sm leading-relaxed;
+  }
+
+  /* Force tabular (monospace) digits everywhere numbers appear */
+  .font-tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Selection colour */
+  ::selection {
+    @apply bg-terminal-accent/30 text-terminal-text;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Component layer: reusable terminal patterns                       */
+/* ------------------------------------------------------------------ */
+@layer components {
+  /* ---- Price display helpers ---- */
+  .price-positive {
+    @apply text-terminal-gain;
+  }
+
+  .price-negative {
+    @apply text-terminal-loss;
+  }
+
+  .price-neutral {
+    @apply text-terminal-text-secondary;
+  }
+
+  .price-flash-up {
+    animation: flashGreen 0.6s ease-out;
+  }
+
+  .price-flash-down {
+    animation: flashRed 0.6s ease-out;
+  }
+
+  /* ---- Badge primitives ---- */
+  .badge {
+    @apply inline-flex items-center rounded px-1.5 py-0.5 text-xxs font-semibold uppercase tracking-wider;
+  }
+
+  .badge-bullish {
+    @apply badge bg-terminal-gain-bg text-terminal-gain;
+  }
+
+  .badge-bearish {
+    @apply badge bg-terminal-loss-bg text-terminal-loss;
+  }
+
+  .badge-neutral {
+    @apply badge bg-terminal-bg-elevated text-terminal-text-muted;
+  }
+
+  /* ---- Card ---- */
+  .terminal-card {
+    @apply rounded-lg border border-terminal-border bg-terminal-bg-secondary p-4;
+  }
+
+  .terminal-card-flush {
+    @apply rounded-lg border border-terminal-border bg-terminal-bg-secondary;
+  }
+
+  /* ---- Table ---- */
+  .terminal-table {
+    @apply w-full text-left text-sm;
+  }
+
+  .terminal-table thead {
+    @apply sticky top-0 z-10 bg-terminal-bg-secondary;
+  }
+
+  .terminal-table th {
+    @apply border-b border-terminal-border px-3 py-2 text-xxs font-semibold uppercase tracking-wider text-terminal-text-muted;
+  }
+
+  .terminal-table td {
+    @apply border-b border-terminal-border/50 px-3 py-2 font-mono text-xs;
+  }
+
+  .terminal-table tbody tr {
+    @apply transition-colors hover:bg-terminal-bg-hover;
+  }
+
+  /* ---- Impact dots (macro calendar) ---- */
+  .impact-dot {
+    @apply inline-block h-2 w-2 rounded-full;
+  }
+
+  .impact-high {
+    @apply impact-dot bg-terminal-loss;
+  }
+
+  .impact-medium {
+    @apply impact-dot bg-terminal-warning;
+  }
+
+  .impact-low {
+    @apply impact-dot bg-terminal-text-muted;
+  }
+
+  /* ---- Scrollable container ---- */
+  .terminal-scroll {
+    @apply overflow-y-auto;
+    scrollbar-width: thin;
+    scrollbar-color: #2e2e3e transparent;
+  }
+
+  /* ---- Sidebar link ---- */
+  .sidebar-link {
+    @apply flex items-center gap-2.5 rounded-md px-3 py-2 text-sm text-terminal-text-secondary transition-colors
+           hover:bg-terminal-bg-hover hover:text-terminal-text;
+  }
+
+  .sidebar-link-active {
+    @apply sidebar-link bg-terminal-accent-bg text-terminal-accent;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Utilities layer                                                   */
+/* ------------------------------------------------------------------ */
+@layer utilities {
+  .text-gain {
+    @apply text-terminal-gain;
+  }
+
+  .text-loss {
+    @apply text-terminal-loss;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Custom scrollbar for Webkit browsers                              */
+/* ------------------------------------------------------------------ */
+.terminal-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.terminal-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.terminal-scroll::-webkit-scrollbar-thumb {
+  background-color: #2e2e3e;
+  border-radius: 3px;
+}
+
+.terminal-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: #3a3a4e;
+}
+
+/* ------------------------------------------------------------------ */
+/*  lightweight-charts overrides for dark terminal look               */
+/* ------------------------------------------------------------------ */
+.tv-lightweight-charts {
+  border-radius: 0.5rem;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Keyframes (duplicated for plain-CSS consumers)                    */
+/* ------------------------------------------------------------------ */
+@keyframes flashGreen {
+  0% { background-color: rgba(0, 200, 83, 0.19); }
+  100% { background-color: transparent; }
+}
+
+@keyframes flashRed {
+  0% { background-color: rgba(255, 23, 68, 0.19); }
+  100% { background-color: transparent; }
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.8); opacity: 1; }
+  100% { transform: scale(2); opacity: 0; }
+}

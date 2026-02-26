@@ -1,0 +1,31 @@
+{
+  "name": "financial-market-terminal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-grade financial market terminal inspired by Bloomberg Terminal",
+  "scripts": {
+    "build:shared": "cd shared && npm run build",
+    "build:api": "cd services/api && npm run build",
+    "build:ingestion": "cd services/data-ingestion && npm run build",
+    "build:analytics": "cd services/analytics && npm run build",
+    "build:frontend": "cd frontend && npm run build",
+    "build": "npm run build:shared && npm run build:api && npm run build:ingestion && npm run build:analytics && npm run build:frontend",
+    "test:ingestion": "cd services/data-ingestion && npm test",
+    "test:analytics": "cd services/analytics && npm test",
+    "test:api": "cd services/api && npm test",
+    "test:frontend": "cd frontend && npm test",
+    "test": "npm run test:ingestion && npm run test:analytics && npm run test:api",
+    "dev:api": "cd services/api && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "docker:up": "cd infra/docker && docker compose up -d",
+    "docker:down": "cd infra/docker && docker compose down",
+    "db:migrate": "psql $DATABASE_URL -f db/migrations/001_instruments.sql",
+    "lint": "npm run lint:api && npm run lint:ingestion && npm run lint:analytics",
+    "lint:api": "cd services/api && npm run lint",
+    "lint:ingestion": "cd services/data-ingestion && npm run lint",
+    "lint:analytics": "cd services/analytics && npm run lint"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

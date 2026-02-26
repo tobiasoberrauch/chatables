@@ -1,0 +1,30 @@
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY shared/package.json shared/tsconfig.json ./shared/
+COPY shared/src ./shared/src
+RUN cd shared && npm install && npm run build
+
+COPY services/analytics/package.json services/analytics/tsconfig.json ./services/analytics/
+RUN cd services/analytics && npm install
+
+COPY services/analytics/src ./services/analytics/src
+RUN cd services/analytics && npm run build
+
+FROM node:20-alpine AS runner
+
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+
+WORKDIR /app
+
+COPY --from=builder /app/shared/dist ./shared/dist
+COPY --from=builder /app/shared/package.json ./shared/
+COPY --from=builder /app/services/analytics/dist ./services/analytics/dist
+COPY --from=builder /app/services/analytics/package.json ./services/analytics/
+COPY --from=builder /app/services/analytics/node_modules ./services/analytics/node_modules
+
+USER appuser
+
+CMD ["node", "services/analytics/dist/index.js"]

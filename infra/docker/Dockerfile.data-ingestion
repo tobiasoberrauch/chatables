@@ -1,0 +1,30 @@
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY shared/package.json shared/tsconfig.json ./shared/
+COPY shared/src ./shared/src
+RUN cd shared && npm install && npm run build
+
+COPY services/data-ingestion/package.json services/data-ingestion/tsconfig.json ./services/data-ingestion/
+RUN cd services/data-ingestion && npm install
+
+COPY services/data-ingestion/src ./services/data-ingestion/src
+RUN cd services/data-ingestion && npm run build
+
+FROM node:20-alpine AS runner
+
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+
+WORKDIR /app
+
+COPY --from=builder /app/shared/dist ./shared/dist
+COPY --from=builder /app/shared/package.json ./shared/
+COPY --from=builder /app/services/data-ingestion/dist ./services/data-ingestion/dist
+COPY --from=builder /app/services/data-ingestion/package.json ./services/data-ingestion/
+COPY --from=builder /app/services/data-ingestion/node_modules ./services/data-ingestion/node_modules
+
+USER appuser
+
+CMD ["node", "services/data-ingestion/dist/ingestion-pipeline.js"]

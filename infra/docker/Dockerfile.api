@@ -1,0 +1,39 @@
+# Multi-stage build for API service
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install shared package
+COPY shared/package.json shared/tsconfig.json ./shared/
+COPY shared/src ./shared/src
+RUN cd shared && npm install && npm run build
+
+# Install API service
+COPY services/api/package.json services/api/tsconfig.json ./services/api/
+RUN cd services/api && npm install
+
+COPY services/api/src ./services/api/src
+RUN cd services/api && npm run build
+
+# ── Production stage ──
+FROM node:20-alpine AS runner
+
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+
+WORKDIR /app
+
+COPY --from=builder /app/shared/dist ./shared/dist
+COPY --from=builder /app/shared/package.json ./shared/
+COPY --from=builder /app/services/api/dist ./services/api/dist
+COPY --from=builder /app/services/api/package.json ./services/api/
+COPY --from=builder /app/services/api/node_modules ./services/api/node_modules
+
+USER appuser
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1
+
+CMD ["node", "services/api/dist/server.js"]
