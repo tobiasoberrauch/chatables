@@ -1,22 +1,56 @@
 /**
- * Data Ingestion Pipeline Orchestrator
+ * Data Ingestion Pipeline -- Main Orchestrator
  *
- * Coordinates all data adapters through the normalization → validation → storage
- * pipeline. Runs on configurable schedules.
+ * Ties together:
+ *   adapters (Polygon, IEX, Alpha Vantage, NewsAPI, FRED)
+ *   -> normalization (ticker resolution, FX pair ordering, timestamps)
+ *   -> validation (OHLCV integrity, anomaly detection)
+ *   -> storage (Postgres via pg, with Redis for caching / streaming)
  *
- * Architecture:
- *   1. Adapter fetches raw data from external provider
- *   2. Normalizer transforms into canonical schema
- *   3. Validator checks data integrity
- *   4. PostgresStore persists validated records
- *   5. RedisCache publishes to streams for downstream consumers
- *
- * Failed records go to a dead-letter log for manual investigation.
+ * Runs on a configurable cron schedule and handles:
+ *   - Parallel ingestion across providers
+ *   - Dead-letter queue for records that fail validation or storage
+ *   - Health checks on all adapters before each run
+ *   - Graceful shutdown
+ *   - Structured logging of every stage
  */
 
+import { CronJob } from 'cron';
+import { Pool, PoolConfig } from 'pg';
+import Redis from 'ioredis';
+
 import { Logger } from '../../../shared/src/utils/logger';
-import type {
+
+// Adapters
+import { PolygonAdapter, PolygonAdapterConfig } from './adapters/polygon-adapter';
+import { IEXAdapter } from './adapters/iex-adapter';
+import { AlphaVantageAdapter } from './adapters/alpha-vantage-adapter';
+import { NewsAdapter } from './adapters/news-adapter';
+import { FREDAdapter } from './adapters/fred-adapter';
+
+// Normalization
+import {
+  InstrumentRegistry,
+  normalizeBars,
+  normalizeFxPair,
+  adjustFxRate,
+  sanitizeBar,
+} from './normalization/normalizer';
+
+// Validation
+import {
+  validateAndFilterBars,
+  validateBatch,
+  validateNewsArticle,
+  validateMacroEvent,
+  validateFundamentals,
+  validateEarnings,
+} from './validation/validator';
+
+// Types
+import {
   OHLCVBar,
+  BarSize,
   Instrument,
   NewsArticle,
   MacroEvent,
@@ -26,17 +60,52 @@ import type {
 
 const logger = new Logger('ingestion-pipeline');
 
-// ─── Types ───
+// ===========================================================================
+// Configuration
+// ===========================================================================
 
 export interface PipelineConfig {
-  /** Instruments to ingest data for (tickers) */
-  tickers: string[];
-  /** Interval between full runs in milliseconds */
-  intervalMs: number;
-  /** Adapters to run */
+  /** Cron expression for scheduled runs (default: every 15 minutes) */
+  schedule: string;
+  /** Timezone for cron (default: America/New_York) */
+  timezone: string;
+
+  /** Postgres connection config */
+  postgres: PoolConfig;
+  /** Redis connection URL */
+  redisUrl: string;
+
+  /** API keys for each provider */
+  apiKeys: {
+    polygon: string;
+    iex: string;
+    alphaVantage: string;
+    newsapi: string;
+    fred: string;
+  };
+
+  /** Tickers to ingest OHLCV bars for */
+  watchlistTickers: string[];
+  /** Enabled adapter names */
   enabledAdapters: AdapterName[];
+
+  /** FX pairs to track, e.g. [['EUR','USD'], ['GBP','USD']] */
+  fxPairs: [string, string][];
+
+  /** FRED series IDs to ingest */
+  fredSeriesIds: string[];
+
+  /** Alpha Vantage macro indicators to ingest */
+  macroIndicators: string[];
+
+  /** Max records in the dead-letter queue before alerting */
+  deadLetterAlertThreshold: number;
+
   /** Maximum retries for a single record */
   maxRecordRetries: number;
+
+  /** Whether to run an immediate ingestion on startup */
+  runOnStart: boolean;
 }
 
 export type AdapterName = 'polygon' | 'iex' | 'alphaVantage' | 'newsapi' | 'fred';
@@ -48,6 +117,8 @@ export interface PipelineMetrics {
   totalRecordsProcessed: number;
   totalRecordsFailed: number;
   deadLetterCount: number;
+  runCount: number;
+  isRunning: boolean;
   adapterMetrics: Record<string, AdapterRunMetrics>;
 }
 
@@ -58,65 +129,125 @@ export interface AdapterRunMetrics {
   lastRunMs: number;
 }
 
-/** A record that failed all retries */
+// ===========================================================================
+// Dead-Letter Queue
+// ===========================================================================
+
 export interface DeadLetterRecord {
-  timestamp: string;
-  adapter: string;
-  recordType: string;
+  id: string;
+  recordType: 'bar' | 'tick' | 'news' | 'macro' | 'fundamentals' | 'earnings';
+  record: unknown;
   error: string;
-  data: unknown;
+  failedAt: string;
+  retryCount: number;
+  source: string;
 }
 
-// ─── Abstract Adapter Interface ───
+class DeadLetterQueue {
+  private records: DeadLetterRecord[] = [];
+  private readonly maxSize: number;
+  private sequenceId = 0;
 
-export interface DataAdapter {
-  name: AdapterName;
-  fetchInstruments?(tickers: string[]): Promise<Partial<Instrument>[]>;
-  fetchBars?(ticker: string, from: string, to: string): Promise<Partial<OHLCVBar>[]>;
-  fetchFundamentals?(ticker: string): Promise<Partial<CompanyFundamentals>[]>;
-  fetchEarnings?(ticker: string): Promise<Partial<EarningsEvent>[]>;
-  fetchNews?(query: string): Promise<Partial<NewsArticle>[]>;
-  fetchMacroEvents?(): Promise<Partial<MacroEvent>[]>;
+  constructor(maxSize: number = 10000) {
+    this.maxSize = maxSize;
+  }
+
+  push(
+    recordType: DeadLetterRecord['recordType'],
+    record: unknown,
+    error: string,
+    source: string,
+  ): void {
+    if (this.records.length >= this.maxSize) {
+      this.records.shift();
+      logger.warn('Dead-letter queue at capacity, evicting oldest record', {
+        maxSize: this.maxSize,
+      });
+    }
+
+    this.records.push({
+      id: `dlq-${++this.sequenceId}`,
+      recordType,
+      record,
+      error,
+      failedAt: new Date().toISOString(),
+      retryCount: 0,
+      source,
+    });
+
+    logger.warn('Record sent to dead letter', { recordType, source, error });
+  }
+
+  drain(): DeadLetterRecord[] {
+    const drained = [...this.records];
+    this.records = [];
+    return drained;
+  }
+
+  get size(): number {
+    return this.records.length;
+  }
+
+  peek(limit: number = 10): DeadLetterRecord[] {
+    return this.records.slice(0, limit);
+  }
 }
 
-// ─── Validator/Normalizer/Store Interfaces ───
+// ===========================================================================
+// Pipeline
+// ===========================================================================
 
-export interface Normalizer {
-  sanitizeBar(bar: Partial<OHLCVBar>): OHLCVBar | null;
-}
-
-export interface Validator {
-  validateBar(bar: OHLCVBar): { valid: boolean; errors: string[] };
-  validateInstrument(inst: Partial<Instrument>): { valid: boolean; errors: string[] };
-}
-
-export interface Store {
-  upsertInstrument(instrument: Instrument): Promise<void>;
-  insertBars(bars: OHLCVBar[]): Promise<number>;
-  upsertFundamentals(f: CompanyFundamentals): Promise<void>;
-  upsertEarnings(e: EarningsEvent): Promise<void>;
-  upsertMacroEvent(event: MacroEvent): Promise<void>;
-  insertNewsArticle(article: NewsArticle): Promise<void>;
-}
-
-export interface Cache {
-  publishTick(tick: unknown): Promise<string>;
-  publishNewsEvent(articleId: string, instrumentIds: string[]): Promise<string>;
-}
-
-// ─── Pipeline ───
+const DEFAULT_CONFIG: PipelineConfig = {
+  schedule: '*/15 * * * *',
+  timezone: 'America/New_York',
+  postgres: {
+    host: process.env.POSTGRES_HOST || 'localhost',
+    port: parseInt(process.env.POSTGRES_PORT || '5432', 10),
+    database: process.env.POSTGRES_DB || 'chatables',
+    user: process.env.POSTGRES_USER || 'chatables',
+    password: process.env.POSTGRES_PASSWORD || '',
+    max: 10,
+    idleTimeoutMillis: 30000,
+  },
+  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
+  apiKeys: {
+    polygon: process.env.POLYGON_API_KEY || '',
+    iex: process.env.IEX_API_KEY || '',
+    alphaVantage: process.env.ALPHA_VANTAGE_API_KEY || '',
+    newsapi: process.env.NEWSAPI_API_KEY || '',
+    fred: process.env.FRED_API_KEY || '',
+  },
+  watchlistTickers: (process.env.WATCHLIST_TICKERS || 'AAPL,MSFT,GOOGL,AMZN,TSLA,SPY,QQQ').split(','),
+  enabledAdapters: ['polygon', 'iex', 'alphaVantage', 'newsapi', 'fred'],
+  fxPairs: [['EUR', 'USD'], ['GBP', 'USD'], ['USD', 'JPY'], ['AUD', 'USD']],
+  fredSeriesIds: ['DGS10', 'DGS2', 'FEDFUNDS', 'UNRATE', 'CPIAUCSL', 'T10Y2Y'],
+  macroIndicators: ['REAL_GDP', 'CPI', 'UNEMPLOYMENT', 'FEDERAL_FUNDS_RATE'],
+  deadLetterAlertThreshold: 100,
+  maxRecordRetries: 3,
+  runOnStart: false,
+};
 
 export class IngestionPipeline {
   private readonly config: PipelineConfig;
-  private readonly adapters: Map<AdapterName, DataAdapter>;
-  private readonly normalizer: Normalizer;
-  private readonly validator: Validator;
-  private readonly store: Store;
-  private readonly cache: Cache;
 
-  private timer: ReturnType<typeof setInterval> | null = null;
+  // Infrastructure
+  private pg!: Pool;
+  private redis!: Redis;
+  private cronJob: CronJob | null = null;
+
+  // Adapters
+  private polygonAdapter!: PolygonAdapter;
+  private iexAdapter!: IEXAdapter;
+  private alphaVantageAdapter!: AlphaVantageAdapter;
+  private newsAdapter!: NewsAdapter;
+  private fredAdapter!: FREDAdapter;
+
+  // State
+  private readonly instrumentRegistry = new InstrumentRegistry();
+  private readonly deadLetterQueue = new DeadLetterQueue();
   private isRunning = false;
-  private deadLetterLog: DeadLetterRecord[] = [];
+  private isShuttingDown = false;
+  private runCount = 0;
 
   private metrics: PipelineMetrics = {
     lastRunStarted: null,
@@ -125,46 +256,80 @@ export class IngestionPipeline {
     totalRecordsProcessed: 0,
     totalRecordsFailed: 0,
     deadLetterCount: 0,
+    runCount: 0,
+    isRunning: false,
     adapterMetrics: {},
   };
 
-  constructor(
-    config: PipelineConfig,
-    adapters: DataAdapter[],
-    normalizer: Normalizer,
-    validator: Validator,
-    store: Store,
-    cache: Cache,
-  ) {
-    this.config = config;
-    this.adapters = new Map(adapters.map((a) => [a.name, a]));
-    this.normalizer = normalizer;
-    this.validator = validator;
-    this.store = store;
-    this.cache = cache;
+  constructor(config: Partial<PipelineConfig> = {}) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
-  /** Start the pipeline on its configured schedule. */
-  start(): void {
-    if (this.timer) return;
+  // -----------------------------------------------------------------------
+  // Lifecycle
+  // -----------------------------------------------------------------------
 
+  async start(): Promise<void> {
     logger.info('Starting ingestion pipeline', {
-      intervalMs: this.config.intervalMs,
-      tickers: this.config.tickers.length,
+      schedule: this.config.schedule,
+      tickers: this.config.watchlistTickers.length,
+      fxPairs: this.config.fxPairs.length,
       adapters: this.config.enabledAdapters,
     });
 
-    // Run immediately, then on interval
-    this.runCycle();
-    this.timer = setInterval(() => this.runCycle(), this.config.intervalMs);
+    // Postgres
+    this.pg = new Pool(this.config.postgres);
+    this.pg.on('error', (err) => {
+      logger.error('Postgres pool error', err);
+    });
+    await this.pg.query('SELECT 1');
+    logger.info('Postgres connected');
+
+    // Redis
+    this.redis = new Redis(this.config.redisUrl, {
+      maxRetriesPerRequest: 3,
+      retryStrategy: (times) => Math.min(times * 200, 5000),
+    });
+    this.redis.on('error', (err) => {
+      logger.error('Redis error', err as Error);
+    });
+    await this.redis.ping();
+    logger.info('Redis connected');
+
+    // Initialize adapters
+    this.initAdapters();
+
+    // Run health checks
+    await this.runHealthChecks();
+
+    // Cron schedule
+    this.cronJob = new CronJob(
+      this.config.schedule,
+      () => this.runCycle(),
+      null,
+      true,
+      this.config.timezone,
+    );
+
+    logger.info('Ingestion pipeline started', { schedule: this.config.schedule });
+
+    // Graceful shutdown handlers
+    process.on('SIGTERM', () => this.stop());
+    process.on('SIGINT', () => this.stop());
+
+    if (this.config.runOnStart) {
+      this.runCycle().catch((err) => {
+        logger.error('Initial ingestion cycle failed', err as Error);
+      });
+    }
   }
 
-  /** Stop the pipeline gracefully. Waits for current run to finish. */
   async stop(): Promise<void> {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
+    logger.info('Shutting down ingestion pipeline');
+
+    this.cronJob?.stop();
 
     // Wait for current run to complete
     const maxWait = 60_000;
@@ -173,270 +338,750 @@ export class IngestionPipeline {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
-    logger.info('Ingestion pipeline stopped', {
-      deadLetterCount: this.deadLetterLog.length,
+    // Persist dead-letter records before shutdown
+    await this.persistDeadLetterQueue();
+
+    try {
+      await this.pg?.end();
+    } catch (err) {
+      logger.error('Error closing Postgres', err as Error);
+    }
+    try {
+      this.redis?.disconnect();
+    } catch (err) {
+      logger.error('Error closing Redis', err as Error);
+    }
+
+    logger.info('Ingestion pipeline shut down', {
+      totalRuns: this.runCount,
+      deadLetterCount: this.deadLetterQueue.size,
     });
+    process.exit(0);
   }
 
-  /** Get current pipeline metrics. */
-  getMetrics(): PipelineMetrics {
-    return { ...this.metrics };
+  // -----------------------------------------------------------------------
+  // Adapter Initialization
+  // -----------------------------------------------------------------------
+
+  private initAdapters(): void {
+    this.polygonAdapter = new PolygonAdapter({
+      providerName: 'polygon',
+      apiKey: this.config.apiKeys.polygon,
+    } as PolygonAdapterConfig);
+
+    this.iexAdapter = new IEXAdapter({
+      providerName: 'iex',
+      apiKey: this.config.apiKeys.iex,
+    });
+
+    this.alphaVantageAdapter = new AlphaVantageAdapter({
+      providerName: 'alphaVantage',
+      apiKey: this.config.apiKeys.alphaVantage,
+    });
+
+    this.newsAdapter = new NewsAdapter({
+      providerName: 'newsapi',
+      apiKey: this.config.apiKeys.newsapi,
+    });
+
+    this.fredAdapter = new FREDAdapter({
+      providerName: 'fred',
+      apiKey: this.config.apiKeys.fred,
+    });
+
+    logger.info('All adapters initialised');
   }
 
-  /** Get dead letter records for investigation. */
-  getDeadLetterLog(): DeadLetterRecord[] {
-    return [...this.deadLetterLog];
+  // -----------------------------------------------------------------------
+  // Health Checks
+  // -----------------------------------------------------------------------
+
+  private async runHealthChecks(): Promise<void> {
+    const checks = [
+      { name: 'polygon', adapter: this.polygonAdapter },
+      { name: 'iex', adapter: this.iexAdapter },
+      { name: 'alphaVantage', adapter: this.alphaVantageAdapter },
+      { name: 'newsapi', adapter: this.newsAdapter },
+      { name: 'fred', adapter: this.fredAdapter },
+    ];
+
+    const results = await Promise.allSettled(
+      checks.map(async ({ name, adapter }) => {
+        const result = await adapter.healthCheck();
+        return { name, ...result };
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        const { name, ok, latencyMs } = result.value;
+        const logFn = ok ? 'info' : 'warn';
+        logger[logFn](`Health check ${ok ? 'passed' : 'failed'}`, {
+          adapter: name,
+          latencyMs,
+        });
+      } else {
+        logger.error('Health check threw', result.reason as Error);
+      }
+    }
   }
 
-  // ─── Core Run Cycle ───
+  // -----------------------------------------------------------------------
+  // Main Ingestion Cycle
+  // -----------------------------------------------------------------------
 
   private async runCycle(): Promise<void> {
     if (this.isRunning) {
-      logger.warn('Skipping run — previous cycle still in progress');
+      logger.warn('Skipping run -- previous cycle still in progress');
       return;
     }
 
     this.isRunning = true;
+    this.runCount++;
     const runStart = Date.now();
+    const cycleId = `cycle-${this.runCount}-${Date.now()}`;
+
     this.metrics.lastRunStarted = new Date().toISOString();
+    this.metrics.isRunning = true;
+    this.metrics.runCount = this.runCount;
 
-    logger.info('Ingestion cycle started');
+    logger.info('Ingestion cycle started', { cycleId, runCount: this.runCount });
 
-    for (const adapterName of this.config.enabledAdapters) {
-      const adapter = this.adapters.get(adapterName);
-      if (!adapter) {
-        logger.warn('Adapter not found, skipping', { adapter: adapterName });
-        continue;
-      }
+    const adapterMetrics: Record<string, AdapterRunMetrics> = {};
 
-      const adapterStart = Date.now();
-      const adapterMetrics: AdapterRunMetrics = {
-        recordsProcessed: 0,
-        recordsFailed: 0,
-        lastError: null,
-        lastRunMs: 0,
-      };
+    // Run all ingestion tasks in parallel
+    const tasks: Array<{ name: string; fn: () => Promise<void> }> = [];
 
-      try {
-        await this.runAdapter(adapter, adapterMetrics);
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        adapterMetrics.lastError = err.message;
-        logger.error(`Adapter ${adapterName} failed`, err);
-      }
-
-      adapterMetrics.lastRunMs = Date.now() - adapterStart;
-      this.metrics.adapterMetrics[adapterName] = adapterMetrics;
-      this.metrics.totalRecordsProcessed += adapterMetrics.recordsProcessed;
-      this.metrics.totalRecordsFailed += adapterMetrics.recordsFailed;
+    if (this.config.enabledAdapters.includes('polygon')) {
+      tasks.push({ name: 'equityBars', fn: () => this.ingestEquityBars(cycleId, adapterMetrics) });
+    }
+    if (this.config.enabledAdapters.includes('alphaVantage')) {
+      tasks.push({ name: 'fxRates', fn: () => this.ingestFxRates(cycleId, adapterMetrics) });
+    }
+    if (this.config.enabledAdapters.includes('fred') || this.config.enabledAdapters.includes('alphaVantage')) {
+      tasks.push({ name: 'macroData', fn: () => this.ingestMacroData(cycleId, adapterMetrics) });
+    }
+    if (this.config.enabledAdapters.includes('newsapi')) {
+      tasks.push({ name: 'news', fn: () => this.ingestNews(cycleId, adapterMetrics) });
+    }
+    if (this.config.enabledAdapters.includes('iex')) {
+      tasks.push({ name: 'fundamentals', fn: () => this.ingestFundamentals(cycleId, adapterMetrics) });
     }
 
-    this.metrics.lastRunDurationMs = Date.now() - runStart;
-    this.metrics.lastRunCompleted = new Date().toISOString();
-    this.metrics.deadLetterCount = this.deadLetterLog.length;
-    this.isRunning = false;
+    const results = await Promise.allSettled(tasks.map((t) => t.fn()));
 
-    logger.info('Ingestion cycle completed', {
-      durationMs: this.metrics.lastRunDurationMs,
-      processed: this.metrics.totalRecordsProcessed,
-      failed: this.metrics.totalRecordsFailed,
-    });
-  }
-
-  private async runAdapter(
-    adapter: DataAdapter,
-    metrics: AdapterRunMetrics,
-  ): Promise<void> {
-    const { tickers } = this.config;
-
-    // Phase 1: OHLCV bars
-    if (adapter.fetchBars) {
-      const to = new Date().toISOString();
-      const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(); // Last 7 days
-
-      for (const ticker of tickers) {
-        try {
-          const rawBars = await adapter.fetchBars(ticker, from, to);
-          const validBars: OHLCVBar[] = [];
-
-          for (const raw of rawBars) {
-            const normalized = this.normalizer.sanitizeBar(raw);
-            if (!normalized) {
-              metrics.recordsFailed++;
-              this.addDeadLetter(adapter.name, 'ohlcv_bar', 'Normalization returned null', raw);
-              continue;
-            }
-
-            const validation = this.validator.validateBar(normalized);
-            if (!validation.valid) {
-              metrics.recordsFailed++;
-              this.addDeadLetter(adapter.name, 'ohlcv_bar', validation.errors.join('; '), raw);
-              continue;
-            }
-
-            validBars.push(normalized);
-            metrics.recordsProcessed++;
-          }
-
-          if (validBars.length > 0) {
-            await this.store.insertBars(validBars);
-          }
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          metrics.lastError = err.message;
-          logger.error(`Failed to fetch bars for ${ticker} from ${adapter.name}`, err);
-        }
-      }
-    }
-
-    // Phase 2: Fundamentals
-    if (adapter.fetchFundamentals) {
-      for (const ticker of tickers) {
-        try {
-          const fundamentals = await adapter.fetchFundamentals(ticker);
-          for (const f of fundamentals) {
-            await this.store.upsertFundamentals(f as CompanyFundamentals);
-            metrics.recordsProcessed++;
-          }
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          metrics.recordsFailed++;
-          logger.error(`Failed to fetch fundamentals for ${ticker}`, err);
-        }
-      }
-    }
-
-    // Phase 3: Earnings
-    if (adapter.fetchEarnings) {
-      for (const ticker of tickers) {
-        try {
-          const earnings = await adapter.fetchEarnings(ticker);
-          for (const e of earnings) {
-            await this.store.upsertEarnings(e as EarningsEvent);
-            metrics.recordsProcessed++;
-          }
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          metrics.recordsFailed++;
-          logger.error(`Failed to fetch earnings for ${ticker}`, err);
-        }
-      }
-    }
-
-    // Phase 4: News
-    if (adapter.fetchNews) {
-      try {
-        const articles = await adapter.fetchNews(tickers.join(' OR '));
-        for (const article of articles) {
-          try {
-            await this.store.insertNewsArticle(article as NewsArticle);
-            if ((article as NewsArticle).id && (article as NewsArticle).instrumentIds) {
-              await this.cache.publishNewsEvent(
-                (article as NewsArticle).id,
-                (article as NewsArticle).instrumentIds,
-              );
-            }
-            metrics.recordsProcessed++;
-          } catch (error) {
-            metrics.recordsFailed++;
-            this.addDeadLetter(adapter.name, 'news_article', String(error), article);
-          }
-        }
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        metrics.lastError = err.message;
-        logger.error(`Failed to fetch news from ${adapter.name}`, err);
-      }
-    }
-
-    // Phase 5: Macro events
-    if (adapter.fetchMacroEvents) {
-      try {
-        const events = await adapter.fetchMacroEvents();
-        for (const event of events) {
-          await this.store.upsertMacroEvent(event as MacroEvent);
-          metrics.recordsProcessed++;
-        }
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        metrics.lastError = err.message;
-        logger.error(`Failed to fetch macro events from ${adapter.name}`, err);
-      }
-    }
-  }
-
-  private addDeadLetter(
-    adapter: string,
-    recordType: string,
-    error: string,
-    data: unknown,
-  ): void {
-    const record: DeadLetterRecord = {
-      timestamp: new Date().toISOString(),
-      adapter,
-      recordType,
-      error,
-      data,
+    // Build summary
+    const summary = {
+      cycleId,
+      durationMs: Date.now() - runStart,
+      tasks: results.map((r, i) => ({
+        task: tasks[i].name,
+        status: r.status,
+        error: r.status === 'rejected' ? (r.reason as Error).message : undefined,
+      })),
+      deadLetterQueueSize: this.deadLetterQueue.size,
     };
 
-    this.deadLetterLog.push(record);
+    // Update metrics
+    this.metrics.lastRunDurationMs = Date.now() - runStart;
+    this.metrics.lastRunCompleted = new Date().toISOString();
+    this.metrics.deadLetterCount = this.deadLetterQueue.size;
+    this.metrics.adapterMetrics = adapterMetrics;
+    this.metrics.isRunning = false;
+    this.isRunning = false;
 
-    // Keep dead letter log bounded (last 10,000 entries)
-    if (this.deadLetterLog.length > 10_000) {
-      this.deadLetterLog = this.deadLetterLog.slice(-10_000);
+    logger.info('Ingestion cycle complete', summary);
+
+    // Alert on large DLQ
+    if (this.deadLetterQueue.size >= this.config.deadLetterAlertThreshold) {
+      logger.warn('Dead-letter queue threshold exceeded', {
+        size: this.deadLetterQueue.size,
+        threshold: this.config.deadLetterAlertThreshold,
+      });
     }
 
-    logger.warn('Record sent to dead letter', {
-      adapter,
-      recordType,
-      error,
-    });
+    // Persist DLQ periodically
+    if (this.runCount % 4 === 0) {
+      await this.persistDeadLetterQueue();
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Equity Bars
+  // -----------------------------------------------------------------------
+
+  private async ingestEquityBars(
+    cycleId: string,
+    adapterMetrics: Record<string, AdapterRunMetrics>,
+  ): Promise<void> {
+    const am: AdapterRunMetrics = { recordsProcessed: 0, recordsFailed: 0, lastError: null, lastRunMs: 0 };
+    const start = Date.now();
+    const today = new Date().toISOString().slice(0, 10);
+    const from = this.daysAgo(7);
+
+    for (const ticker of this.config.watchlistTickers) {
+      try {
+        const instrument = this.instrumentRegistry.resolveBySourceTicker('polygon', ticker);
+        const instrumentId = instrument?.id || '';
+
+        const rawBars = await this.polygonAdapter.fetchHistoricalBars(
+          ticker, from, today, BarSize.DAY_1, true, instrumentId,
+        );
+
+        if (rawBars.length === 0) {
+          logger.info('No new bars from Polygon', { ticker, from, to: today });
+          continue;
+        }
+
+        // Normalize
+        const normalized = normalizeBars(rawBars);
+
+        // Sanitize
+        const sanitized = normalized
+          .map(sanitizeBar)
+          .filter((b): b is OHLCVBar => b !== null);
+
+        // Validate
+        const { bars: validBars, summary } = validateAndFilterBars(sanitized);
+
+        am.recordsProcessed += summary.accepted;
+        am.recordsFailed += summary.rejected;
+
+        logger.info('Equity bars processed', {
+          cycleId, ticker,
+          raw: rawBars.length,
+          accepted: summary.accepted,
+          rejected: summary.rejected,
+        });
+
+        // Dead-letter rejected bars
+        if (summary.rejected > 0) {
+          for (let i = 0; i < sanitized.length; i++) {
+            if (!validBars.includes(sanitized[i])) {
+              this.deadLetterQueue.push('bar', sanitized[i], 'Validation failed', 'polygon');
+            }
+          }
+        }
+
+        // Persist valid bars
+        if (validBars.length > 0) {
+          await this.storeBars(validBars);
+        }
+      } catch (err) {
+        am.lastError = (err as Error).message;
+        am.recordsFailed++;
+        logger.error('Failed to ingest equity bars', err as Error, { cycleId, ticker });
+        this.deadLetterQueue.push('bar', { ticker, from, to: today }, (err as Error).message, 'polygon');
+      }
+    }
+
+    am.lastRunMs = Date.now() - start;
+    adapterMetrics['polygon'] = am;
+  }
+
+  // -----------------------------------------------------------------------
+  // FX Rates
+  // -----------------------------------------------------------------------
+
+  private async ingestFxRates(
+    cycleId: string,
+    adapterMetrics: Record<string, AdapterRunMetrics>,
+  ): Promise<void> {
+    const am: AdapterRunMetrics = { recordsProcessed: 0, recordsFailed: 0, lastError: null, lastRunMs: 0 };
+    const start = Date.now();
+
+    for (const [currA, currB] of this.config.fxPairs) {
+      try {
+        const normalized = normalizeFxPair(currA, currB);
+        const rateData = await this.alphaVantageAdapter.fetchFxRate(normalized.base, normalized.quote);
+        const rate = adjustFxRate(rateData.rate, normalized.wasInverted);
+
+        // Cache in Redis
+        const cacheKey = `fx:${normalized.pair}`;
+        await this.redis.set(cacheKey, JSON.stringify({
+          pair: normalized.pair,
+          rate,
+          bid: rateData.bidPrice,
+          ask: rateData.askPrice,
+          timestamp: rateData.timestamp,
+        }), 'EX', 900);
+
+        am.recordsProcessed++;
+        logger.info('FX rate cached', { cycleId, pair: normalized.pair, rate });
+      } catch (err) {
+        am.lastError = (err as Error).message;
+        am.recordsFailed++;
+        logger.error('Failed to ingest FX rate', err as Error, { cycleId, pair: `${currA}/${currB}` });
+        this.deadLetterQueue.push('bar', { currA, currB }, (err as Error).message, 'alphaVantage');
+      }
+    }
+
+    am.lastRunMs = Date.now() - start;
+    adapterMetrics['alphaVantage'] = { ...adapterMetrics['alphaVantage'] || am, ...am };
+  }
+
+  // -----------------------------------------------------------------------
+  // Macro Data
+  // -----------------------------------------------------------------------
+
+  private async ingestMacroData(
+    cycleId: string,
+    adapterMetrics: Record<string, AdapterRunMetrics>,
+  ): Promise<void> {
+    const am: AdapterRunMetrics = { recordsProcessed: 0, recordsFailed: 0, lastError: null, lastRunMs: 0 };
+    const start = Date.now();
+
+    // FRED series
+    if (this.config.enabledAdapters.includes('fred')) {
+      for (const seriesId of this.config.fredSeriesIds) {
+        try {
+          const threeMonthsAgo = this.daysAgo(90);
+          const events = await this.fredAdapter.fetchSeries(seriesId, threeMonthsAgo);
+          const { records: validated, summary } = validateBatch(events, validateMacroEvent);
+          const accepted = validated.filter((v) => v.accepted).map((v) => v.record);
+
+          am.recordsProcessed += summary.accepted;
+          am.recordsFailed += summary.rejected;
+
+          if (accepted.length > 0) {
+            await this.storeMacroEvents(accepted);
+          }
+
+          for (const v of validated.filter((v) => !v.accepted)) {
+            this.deadLetterQueue.push('macro', v.record, 'Validation failed', 'fred');
+          }
+
+          logger.info('FRED series ingested', { cycleId, seriesId, accepted: summary.accepted });
+        } catch (err) {
+          am.lastError = (err as Error).message;
+          am.recordsFailed++;
+          logger.error('Failed to ingest FRED series', err as Error, { cycleId, seriesId });
+          this.deadLetterQueue.push('macro', { seriesId }, (err as Error).message, 'fred');
+        }
+      }
+
+      // FRED calendar
+      try {
+        const calendarEvents = await this.fredAdapter.fetchMacroCalendar(14);
+        if (calendarEvents.length > 0) {
+          await this.storeMacroEvents(calendarEvents);
+          am.recordsProcessed += calendarEvents.length;
+          logger.info('FRED macro calendar ingested', { cycleId, count: calendarEvents.length });
+        }
+      } catch (err) {
+        logger.error('Failed to ingest FRED calendar', err as Error, { cycleId });
+      }
+    }
+
+    // Alpha Vantage macro indicators
+    if (this.config.enabledAdapters.includes('alphaVantage')) {
+      for (const indicator of this.config.macroIndicators) {
+        try {
+          const events = await this.alphaVantageAdapter.fetchMacroindicator(indicator);
+          const recent = events.slice(0, 12);
+          const { records: validated, summary } = validateBatch(recent, validateMacroEvent);
+          const accepted = validated.filter((v) => v.accepted).map((v) => v.record);
+
+          am.recordsProcessed += summary.accepted;
+          if (accepted.length > 0) await this.storeMacroEvents(accepted);
+
+          logger.info('AV macro indicator ingested', { cycleId, indicator, accepted: summary.accepted });
+        } catch (err) {
+          am.lastError = (err as Error).message;
+          am.recordsFailed++;
+          logger.error('Failed to ingest AV macro', err as Error, { cycleId, indicator });
+          this.deadLetterQueue.push('macro', { indicator }, (err as Error).message, 'alphaVantage');
+        }
+      }
+    }
+
+    am.lastRunMs = Date.now() - start;
+    adapterMetrics['fred'] = am;
+  }
+
+  // -----------------------------------------------------------------------
+  // News
+  // -----------------------------------------------------------------------
+
+  private async ingestNews(
+    cycleId: string,
+    adapterMetrics: Record<string, AdapterRunMetrics>,
+  ): Promise<void> {
+    const am: AdapterRunMetrics = { recordsProcessed: 0, recordsFailed: 0, lastError: null, lastRunMs: 0 };
+    const start = Date.now();
+
+    try {
+      const headlines = await this.newsAdapter.fetchTopHeadlines('business', 'us', 50);
+      const searchResults: NewsArticle[] = [];
+
+      // Search for articles about a subset of our watchlist tickers
+      const tickerQueries = this.config.watchlistTickers.slice(0, 5);
+      for (const ticker of tickerQueries) {
+        try {
+          const articles = await this.newsAdapter.searchNews(ticker, this.daysAgo(1), undefined, 1, 20);
+          searchResults.push(...articles);
+        } catch (err) {
+          logger.warn('News search failed for ticker', { ticker, error: (err as Error).message });
+        }
+      }
+
+      const allArticles = [...headlines, ...searchResults];
+
+      // Deduplicate by URL
+      const seen = new Set<string>();
+      const unique = allArticles.filter((a) => {
+        if (seen.has(a.url)) return false;
+        seen.add(a.url);
+        return true;
+      });
+
+      const { records: validated, summary } = validateBatch(unique, validateNewsArticle);
+      const accepted = validated.filter((v) => v.accepted).map((v) => v.record);
+
+      am.recordsProcessed += summary.accepted;
+      am.recordsFailed += summary.rejected;
+
+      if (accepted.length > 0) {
+        await this.storeNewsArticles(accepted);
+      }
+
+      for (const v of validated.filter((v) => !v.accepted)) {
+        this.deadLetterQueue.push('news', v.record, 'Validation failed', 'newsapi');
+      }
+
+      logger.info('News ingested', { cycleId, raw: allArticles.length, unique: unique.length, accepted: summary.accepted });
+    } catch (err) {
+      am.lastError = (err as Error).message;
+      logger.error('Failed to ingest news', err as Error, { cycleId });
+      this.deadLetterQueue.push('news', {}, (err as Error).message, 'newsapi');
+    }
+
+    am.lastRunMs = Date.now() - start;
+    adapterMetrics['newsapi'] = am;
+  }
+
+  // -----------------------------------------------------------------------
+  // Fundamentals & Earnings
+  // -----------------------------------------------------------------------
+
+  private async ingestFundamentals(
+    cycleId: string,
+    adapterMetrics: Record<string, AdapterRunMetrics>,
+  ): Promise<void> {
+    const am: AdapterRunMetrics = { recordsProcessed: 0, recordsFailed: 0, lastError: null, lastRunMs: 0 };
+    const start = Date.now();
+
+    // Rotate through tickers each cycle to spread load
+    const batchSize = 3;
+    const offset = ((this.runCount - 1) * batchSize) % this.config.watchlistTickers.length;
+    const tickersThisCycle = this.config.watchlistTickers.slice(offset, offset + batchSize);
+
+    for (const ticker of tickersThisCycle) {
+      try {
+        const instrument = this.instrumentRegistry.resolveBySourceTicker('iex', ticker);
+        const instrumentId = instrument?.id || '';
+
+        // Fundamentals
+        const fundamentals = await this.iexAdapter.fetchCompanyFundamentals(ticker, instrumentId);
+        const fundResult = validateFundamentals(fundamentals);
+        if (fundResult.valid) {
+          await this.storeFundamentals(fundamentals);
+          am.recordsProcessed++;
+        } else {
+          am.recordsFailed++;
+          logger.warn('Fundamentals validation failed', { ticker, issues: fundResult.issues.map((i) => i.code) });
+          this.deadLetterQueue.push('fundamentals', fundamentals, 'Validation failed', 'iex');
+        }
+
+        // Earnings
+        const earnings = await this.iexAdapter.fetchEarnings(ticker, instrumentId, 4);
+        const { records: validatedEarnings, summary: earnSummary } = validateBatch(earnings, validateEarnings);
+        const acceptedEarnings = validatedEarnings.filter((v) => v.accepted).map((v) => v.record);
+
+        am.recordsProcessed += earnSummary.accepted;
+        am.recordsFailed += earnSummary.rejected;
+
+        if (acceptedEarnings.length > 0) {
+          await this.storeEarnings(acceptedEarnings);
+        }
+
+        logger.info('Fundamentals/earnings ingested', { cycleId, ticker, fundValid: fundResult.valid, earnings: earnSummary.accepted });
+      } catch (err) {
+        am.lastError = (err as Error).message;
+        am.recordsFailed++;
+        logger.error('Failed to ingest fundamentals', err as Error, { cycleId, ticker });
+        this.deadLetterQueue.push('fundamentals', { ticker }, (err as Error).message, 'iex');
+      }
+    }
+
+    am.lastRunMs = Date.now() - start;
+    adapterMetrics['iex'] = am;
+  }
+
+  // -----------------------------------------------------------------------
+  // Storage Layer
+  // -----------------------------------------------------------------------
+
+  private async storeBars(bars: OHLCVBar[]): Promise<void> {
+    const client = await this.pg.connect();
+    try {
+      await client.query('BEGIN');
+      const query = `
+        INSERT INTO ohlcv_bars (
+          instrument_id, timestamp, open, high, low, close,
+          volume, vwap, trades, bar_size, is_adjusted, source
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (instrument_id, timestamp, bar_size)
+        DO UPDATE SET
+          open = EXCLUDED.open, high = EXCLUDED.high,
+          low = EXCLUDED.low, close = EXCLUDED.close,
+          volume = EXCLUDED.volume, vwap = EXCLUDED.vwap,
+          trades = EXCLUDED.trades, is_adjusted = EXCLUDED.is_adjusted,
+          source = EXCLUDED.source, updated_at = NOW()
+      `;
+      for (const bar of bars) {
+        await client.query(query, [
+          bar.instrumentId, bar.timestamp, bar.open, bar.high,
+          bar.low, bar.close, bar.volume, bar.vwap,
+          bar.trades, bar.barSize, bar.isAdjusted, bar.source,
+        ]);
+      }
+      await client.query('COMMIT');
+      this.metrics.totalRecordsProcessed += bars.length;
+      logger.debug('Stored bars', { count: bars.length });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      this.metrics.totalRecordsFailed += bars.length;
+      logger.error('Failed to store bars', err as Error, { count: bars.length });
+      for (const bar of bars) {
+        this.deadLetterQueue.push('bar', bar, (err as Error).message, bar.source);
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  private async storeMacroEvents(events: MacroEvent[]): Promise<void> {
+    const client = await this.pg.connect();
+    try {
+      await client.query('BEGIN');
+      const query = `
+        INSERT INTO macro_events (
+          id, name, country, category, scheduled_at,
+          actual, forecast, previous, unit, impact, source
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (id)
+        DO UPDATE SET
+          actual = COALESCE(EXCLUDED.actual, macro_events.actual),
+          forecast = COALESCE(EXCLUDED.forecast, macro_events.forecast),
+          previous = COALESCE(EXCLUDED.previous, macro_events.previous),
+          updated_at = NOW()
+      `;
+      for (const event of events) {
+        await client.query(query, [
+          event.id, event.name, event.country, event.category,
+          event.scheduledAt, event.actual, event.forecast,
+          event.previous, event.unit, event.impact, event.source,
+        ]);
+      }
+      await client.query('COMMIT');
+      logger.debug('Stored macro events', { count: events.length });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      logger.error('Failed to store macro events', err as Error);
+      for (const ev of events) {
+        this.deadLetterQueue.push('macro', ev, (err as Error).message, ev.source);
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  private async storeNewsArticles(articles: NewsArticle[]): Promise<void> {
+    const client = await this.pg.connect();
+    try {
+      await client.query('BEGIN');
+      const query = `
+        INSERT INTO news_articles (
+          id, title, summary, content, url, source,
+          published_at, instrument_ids, tickers,
+          sentiment_score, sentiment_label, categories
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (url)
+        DO UPDATE SET
+          sentiment_score = COALESCE(EXCLUDED.sentiment_score, news_articles.sentiment_score),
+          instrument_ids = EXCLUDED.instrument_ids, updated_at = NOW()
+      `;
+      for (const article of articles) {
+        await client.query(query, [
+          article.id, article.title, article.summary, article.content,
+          article.url, article.source, article.publishedAt,
+          JSON.stringify(article.instrumentIds), JSON.stringify(article.tickers),
+          article.sentimentScore, article.sentimentLabel, JSON.stringify(article.categories),
+        ]);
+      }
+      await client.query('COMMIT');
+
+      // Publish to Redis stream for real-time subscribers
+      for (const article of articles) {
+        await this.redis.xadd('stream:news', '*',
+          'id', article.id,
+          'title', article.title,
+          'source', article.source,
+          'tickers', JSON.stringify(article.tickers),
+        );
+      }
+
+      logger.debug('Stored news articles', { count: articles.length });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      logger.error('Failed to store news articles', err as Error);
+      for (const a of articles) {
+        this.deadLetterQueue.push('news', a, (err as Error).message, 'newsapi');
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  private async storeFundamentals(f: CompanyFundamentals): Promise<void> {
+    try {
+      const query = `
+        INSERT INTO company_fundamentals (
+          instrument_id, report_date, period, fiscal_year,
+          revenue, net_income, eps, eps_estimate,
+          market_cap, pe_ratio, pb_ratio, debt_to_equity,
+          dividend_yield, free_cash_flow, currency, source
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        ON CONFLICT (instrument_id, report_date, period)
+        DO UPDATE SET
+          revenue = COALESCE(EXCLUDED.revenue, company_fundamentals.revenue),
+          net_income = COALESCE(EXCLUDED.net_income, company_fundamentals.net_income),
+          market_cap = EXCLUDED.market_cap, pe_ratio = EXCLUDED.pe_ratio, updated_at = NOW()
+      `;
+      await this.pg.query(query, [
+        f.instrumentId, f.reportDate, f.period, f.fiscalYear,
+        f.revenue, f.netIncome, f.eps, f.epsEstimate,
+        f.marketCap, f.peRatio, f.pbRatio, f.debtToEquity,
+        f.dividendYield, f.freeCashFlow, f.currency, f.source,
+      ]);
+    } catch (err) {
+      logger.error('Failed to store fundamentals', err as Error);
+      this.deadLetterQueue.push('fundamentals', f, (err as Error).message, f.source);
+    }
+  }
+
+  private async storeEarnings(earnings: EarningsEvent[]): Promise<void> {
+    const client = await this.pg.connect();
+    try {
+      await client.query('BEGIN');
+      const query = `
+        INSERT INTO earnings_events (
+          instrument_id, report_date, fiscal_quarter,
+          eps_actual, eps_estimate, revenue_actual, revenue_estimate,
+          surprise, transcript_url, source
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (instrument_id, report_date)
+        DO UPDATE SET
+          eps_actual = COALESCE(EXCLUDED.eps_actual, earnings_events.eps_actual),
+          revenue_actual = COALESCE(EXCLUDED.revenue_actual, earnings_events.revenue_actual),
+          surprise = COALESCE(EXCLUDED.surprise, earnings_events.surprise),
+          updated_at = NOW()
+      `;
+      for (const e of earnings) {
+        await client.query(query, [
+          e.instrumentId, e.reportDate, e.fiscalQuarter,
+          e.epsActual, e.epsEstimate, e.revenueActual, e.revenueEstimate,
+          e.surprise, e.transcriptUrl, e.source,
+        ]);
+      }
+      await client.query('COMMIT');
+      logger.debug('Stored earnings', { count: earnings.length });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      logger.error('Failed to store earnings', err as Error);
+      for (const e of earnings) {
+        this.deadLetterQueue.push('earnings', e, (err as Error).message, e.source);
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Dead-Letter Queue Persistence
+  // -----------------------------------------------------------------------
+
+  private async persistDeadLetterQueue(): Promise<void> {
+    const records = this.deadLetterQueue.drain();
+    if (records.length === 0) return;
+
+    try {
+      const pipeline = this.redis.pipeline();
+      for (const record of records) {
+        pipeline.rpush('dlq:ingestion', JSON.stringify(record));
+      }
+      pipeline.ltrim('dlq:ingestion', -10000, -1);
+      await pipeline.exec();
+      logger.info('Dead-letter queue persisted to Redis', { count: records.length });
+    } catch (err) {
+      logger.error('Failed to persist DLQ to Redis', err as Error, { count: records.length });
+      // Re-queue records
+      for (const record of records) {
+        this.deadLetterQueue.push(record.recordType, record.record, record.error, record.source);
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Helpers & Public API
+  // -----------------------------------------------------------------------
+
+  private daysAgo(n: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() - n);
+    return d.toISOString().slice(0, 10);
+  }
+
+  getMetrics(): PipelineMetrics {
+    return { ...this.metrics, deadLetterCount: this.deadLetterQueue.size };
+  }
+
+  getDeadLetterLog(): DeadLetterRecord[] {
+    return this.deadLetterQueue.peek(100);
+  }
+
+  getInstrumentRegistry(): InstrumentRegistry {
+    return this.instrumentRegistry;
   }
 }
 
-// ─── Entry Point ───
+// ===========================================================================
+// Entry Point
+// ===========================================================================
 
-const DEFAULT_CONFIG: PipelineConfig = {
-  tickers: ['AAPL', 'MSFT', 'AMZN', 'META', 'TSLA', 'SPY', 'QQQ'],
-  intervalMs: 5 * 60 * 1000, // 5 minutes
-  enabledAdapters: ['polygon', 'iex', 'alphaVantage', 'newsapi', 'fred'],
-  maxRecordRetries: 3,
-};
-
-/**
- * Main entry point when running as a standalone service.
- * Connects to PostgreSQL and Redis, initializes adapters, and starts the pipeline.
- */
 async function main(): Promise<void> {
-  logger.info('Data ingestion service starting...');
+  logger.info('Data ingestion service starting');
 
-  // In production, adapters, store, and cache would be instantiated with
-  // real connections to PostgreSQL, Redis, and external APIs.
-  // The pipeline is designed to receive these as injected dependencies.
-
-  logger.info('Pipeline configuration', {
-    tickers: DEFAULT_CONFIG.tickers,
-    intervalMs: DEFAULT_CONFIG.intervalMs,
-    adapters: DEFAULT_CONFIG.enabledAdapters,
+  const pipeline = new IngestionPipeline({
+    runOnStart: process.env.RUN_ON_START === 'true',
+    schedule: process.env.INGESTION_SCHEDULE || '*/15 * * * *',
   });
 
-  logger.info('Waiting for adapter initialization...');
-  logger.info('To run in production, instantiate adapters with API keys from environment');
-  logger.info('Example: POLYGON_API_KEY, IEX_API_KEY, ALPHA_VANTAGE_API_KEY, NEWS_API_KEY, FRED_API_KEY');
-
-  // Graceful shutdown
-  const shutdown = async (): Promise<void> => {
-    logger.info('Shutting down ingestion service...');
-    process.exit(0);
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  try {
+    await pipeline.start();
+  } catch (err) {
+    logger.error('Failed to start ingestion pipeline', err as Error);
+    process.exit(1);
+  }
 }
 
-main().catch((err) => {
-  logger.error('Fatal error in ingestion service', err as Error);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    logger.error('Fatal error in ingestion service', err as Error);
+    process.exit(1);
+  });
+}
 
 export { DEFAULT_CONFIG };
+export default IngestionPipeline;
