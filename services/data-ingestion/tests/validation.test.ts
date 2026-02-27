@@ -1,5 +1,5 @@
 /**
- * Validation Pipeline — Unit Tests
+ * Validation Pipeline -- Unit Tests
  *
  * Tests the data validation layer that ensures market data integrity
  * before it enters the storage pipeline.
@@ -96,12 +96,20 @@ describe('OHLCV bar validation', () => {
     expect(errors[0].severity).toBe(ValidationSeverity.ERROR);
   });
 
-  it('fails when a price field is zero', () => {
+  it('fails when any OHLC price is zero', () => {
     const bar = makeBar({ close: 0 });
     const result = validateOHLCVBar(bar);
     expect(result.valid).toBe(false);
-    const errors = result.issues.filter((i) => i.code === 'ZERO_PRICE');
+    const errors = result.issues.filter((i) => i.code === 'NON_POSITIVE_PRICE');
     expect(errors).toHaveLength(1);
+  });
+
+  it('fails when all prices are zero', () => {
+    const bar = makeBar({ open: 0, high: 0, low: 0, close: 0 });
+    const result = validateOHLCVBar(bar);
+    expect(result.valid).toBe(false);
+    const zeroErrors = result.issues.filter((i) => i.code === 'NON_POSITIVE_PRICE');
+    expect(zeroErrors).toHaveLength(1);
   });
 
   it('fails when a price is NaN', () => {
@@ -128,10 +136,9 @@ describe('OHLCV bar validation', () => {
 
   it('warns when open is outside high-low range', () => {
     const bar = makeBar({ open: 160, high: 155, low: 148, close: 152 });
-    // This has both HIGH_LESS_THAN_LOW=false (high > low), but open > high
     const result = validateOHLCVBar(bar);
     const warnings = result.issues.filter(
-      (i) => i.code === 'OPEN_OUT_OF_RANGE' && i.severity === ValidationSeverity.WARNING,
+      (i) => i.code === 'OPEN_ABOVE_HIGH' && i.severity === ValidationSeverity.WARNING,
     );
     expect(warnings).toHaveLength(1);
   });
@@ -140,7 +147,7 @@ describe('OHLCV bar validation', () => {
     const bar = makeBar({ close: 145, high: 155, low: 148 });
     const result = validateOHLCVBar(bar);
     const warnings = result.issues.filter(
-      (i) => i.code === 'CLOSE_OUT_OF_RANGE' && i.severity === ValidationSeverity.WARNING,
+      (i) => i.code === 'CLOSE_BELOW_LOW' && i.severity === ValidationSeverity.WARNING,
     );
     expect(warnings).toHaveLength(1);
   });
@@ -150,7 +157,7 @@ describe('OHLCV bar validation', () => {
     const result = validateOHLCVBar(bar);
     expect(result.valid).toBe(false);
     const errors = result.issues.filter((i) => i.severity === ValidationSeverity.ERROR);
-    expect(errors.length).toBeGreaterThanOrEqual(3); // high<low, negative volume, zero price
+    expect(errors.length).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -159,7 +166,7 @@ describe('OHLCV bar validation', () => {
 // ---------------------------------------------------------------------------
 
 describe('Price jump detection', () => {
-  it('detects a > 50% price jump between consecutive bars', () => {
+  it('flags a > 50% price jump between consecutive bars', () => {
     const bars: OHLCVBar[] = [
       makeBar({ timestamp: '2024-06-10T00:00:00.000Z', close: 100 }),
       makeBar({ timestamp: '2024-06-11T00:00:00.000Z', close: 160 }), // 60% jump
@@ -173,7 +180,7 @@ describe('Price jump detection', () => {
   it('does not flag a small price change', () => {
     const bars: OHLCVBar[] = [
       makeBar({ timestamp: '2024-06-10T00:00:00.000Z', close: 100 }),
-      makeBar({ timestamp: '2024-06-11T00:00:00.000Z', close: 102 }), // 2% change
+      makeBar({ timestamp: '2024-06-11T00:00:00.000Z', close: 102 }),
     ];
     const result = validateBarSeries(bars, { maxPriceJumpPercent: 50 });
     const jumps = result.issues.filter((i) => i.code === 'PRICE_JUMP');
@@ -204,28 +211,6 @@ describe('Price jump detection', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Empty/zero price detection
-// ---------------------------------------------------------------------------
-
-describe('Empty/zero price detection', () => {
-  it('flags a bar with all zero prices', () => {
-    const bar = makeBar({ open: 0, high: 0, low: 0, close: 0 });
-    const result = validateOHLCVBar(bar);
-    expect(result.valid).toBe(false);
-    const errors = result.issues.filter((i) => i.code === 'ZERO_PRICE');
-    expect(errors).toHaveLength(1);
-  });
-
-  it('flags a bar with only one zero price', () => {
-    const bar = makeBar({ open: 0, high: 155, low: 148, close: 152 });
-    const result = validateOHLCVBar(bar);
-    expect(result.valid).toBe(false);
-    const errors = result.issues.filter((i) => i.code === 'ZERO_PRICE');
-    expect(errors).toHaveLength(1);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Timestamp ordering validation
 // ---------------------------------------------------------------------------
 
@@ -244,7 +229,7 @@ describe('Timestamp ordering validation', () => {
   it('fails when bars are out of order', () => {
     const bars: OHLCVBar[] = [
       makeBar({ timestamp: '2024-06-12T00:00:00.000Z' }),
-      makeBar({ timestamp: '2024-06-11T00:00:00.000Z' }), // Out of order
+      makeBar({ timestamp: '2024-06-11T00:00:00.000Z' }),
       makeBar({ timestamp: '2024-06-13T00:00:00.000Z' }),
     ];
     const result = validateBarSeries(bars);
@@ -256,7 +241,7 @@ describe('Timestamp ordering validation', () => {
   it('detects duplicate timestamps', () => {
     const bars: OHLCVBar[] = [
       makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }),
-      makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }), // Duplicate
+      makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }),
     ];
     const result = validateBarSeries(bars);
     const dupes = result.issues.filter((i) => i.code === 'DUPLICATE_TIMESTAMP');
@@ -312,7 +297,7 @@ describe('Instrument field completeness', () => {
     expect(result.valid).toBe(false);
   });
 
-  it('warns on invalid currency code format', () => {
+  it('reports error on invalid currency code format', () => {
     const instrument = makeInstrument({ currency: 'USDD' });
     const result = validateInstrument(instrument);
     const currencyErrors = result.issues.filter((i) => i.code === 'INVALID_CURRENCY');
@@ -326,7 +311,7 @@ describe('Instrument field completeness', () => {
     expect(countryWarnings).toHaveLength(1);
   });
 
-  it('allows null optional fields (isin, figi, sector, industry)', () => {
+  it('allows null optional fields', () => {
     const instrument = makeInstrument({
       isin: null,
       figi: null,
@@ -347,7 +332,7 @@ describe('Duplicate bar detection', () => {
     const bars: OHLCVBar[] = [
       makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }),
       makeBar({ timestamp: '2024-06-11T00:00:00.000Z' }),
-      makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }), // Duplicate of index 0
+      makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }),
     ];
     const duplicates = detectDuplicateBars(bars);
     expect(duplicates).toEqual([2]);
@@ -366,11 +351,22 @@ describe('Duplicate bar detection', () => {
     const bars: OHLCVBar[] = [
       makeBar({ timestamp: '2024-06-10T00:00:00.000Z', close: 100 }),
       makeBar({ timestamp: '2024-06-11T00:00:00.000Z', close: 102 }),
-      makeBar({ timestamp: '2024-06-10T00:00:00.000Z', close: 101 }), // Dup
+      makeBar({ timestamp: '2024-06-10T00:00:00.000Z', close: 101 }),
     ];
     const deduped = deduplicateBars(bars);
     expect(deduped).toHaveLength(2);
-    expect(deduped[0].close).toBe(100); // Keep first occurrence
+    expect(deduped[0].close).toBe(100); // Keeps first occurrence
     expect(deduped[1].close).toBe(102);
+  });
+
+  it('detects multiple duplicate groups', () => {
+    const bars: OHLCVBar[] = [
+      makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }),
+      makeBar({ timestamp: '2024-06-11T00:00:00.000Z' }),
+      makeBar({ timestamp: '2024-06-10T00:00:00.000Z' }),
+      makeBar({ timestamp: '2024-06-11T00:00:00.000Z' }),
+    ];
+    const duplicates = detectDuplicateBars(bars);
+    expect(duplicates).toEqual([2, 3]);
   });
 });

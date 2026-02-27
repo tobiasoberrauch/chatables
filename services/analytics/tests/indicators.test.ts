@@ -17,7 +17,7 @@ function makeBar(close: number, overrides: Partial<OHLCVBar> = {}): OHLCVBar {
   barIndex++;
   return {
     instrumentId: 'TEST',
-    timestamp: `2025-01-${String(barIndex).padStart(2, '0')}T16:00:00.000Z`,
+    timestamp: overrides.timestamp ?? `2025-01-${String(barIndex).padStart(2, '0')}T16:00:00.000Z`,
     open: overrides.open ?? close,
     high: overrides.high ?? close,
     low: overrides.low ?? close,
@@ -40,8 +40,14 @@ function makeBarsWithVolume(
   data: Array<{ high: number; low: number; close: number; volume: number }>,
 ): OHLCVBar[] {
   barIndex = 0;
-  return data.map((d) =>
-    makeBar(d.close, { high: d.high, low: d.low, volume: d.volume }),
+  return data.map((d, i) =>
+    makeBar(d.close, {
+      high: d.high,
+      low: d.low,
+      volume: d.volume,
+      // Use intraday timestamps on the same date to avoid VWAP session resets
+      timestamp: `2025-01-15T${String(10 + i).padStart(2, '0')}:00:00.000Z`,
+    }),
   );
 }
 
@@ -220,14 +226,19 @@ describe('RSI (Relative Strength Index)', () => {
 
   it('returns RSI ~50 when gains and losses are balanced', () => {
     // Alternating: +1, -1, +1, -1 ... (equal average gain and loss)
+    // With Wilder's smoothing, RSI converges toward 50 but may not be
+    // exactly 50 in early values. Use a wider tolerance and verify
+    // the first RSI value (which uses SMA seed and should be exactly 50).
     const bars = makeBars([10, 11, 10, 11, 10, 11, 10, 11, 10]);
     const result = computeRSI(bars, { period: 4 });
 
     expect(result.values.length).toBeGreaterThan(0);
-    // With balanced gains/losses, RSI should be approximately 50
+    // First RSI: SMA of first 4 changes = [+1,-1,+1,-1] → avgGain=0.5, avgLoss=0.5 → RSI=50
+    expect(result.values[0].value).toBeCloseTo(50, 6);
+    // Subsequent values may drift due to Wilder's smoothing but stay in a reasonable range
     for (const v of result.values) {
-      expect(v.value).toBeGreaterThanOrEqual(45);
-      expect(v.value).toBeLessThanOrEqual(55);
+      expect(v.value).toBeGreaterThanOrEqual(30);
+      expect(v.value).toBeLessThanOrEqual(70);
     }
   });
 

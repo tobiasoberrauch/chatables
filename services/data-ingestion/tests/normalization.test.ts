@@ -187,11 +187,13 @@ describe('FX pair normalization', () => {
     expect(result.quote).toBe('USD');
   });
 
-  it('handles exotic pairs with equal priority (first arg stays as base)', () => {
+  it('handles exotic pairs with equal priority (alphabetical tiebreaker)', () => {
+    // Both SGD and HKD have priority 0. When equal, alphabetical order is used.
+    // HKD < SGD alphabetically, so HKD becomes the base.
     const result = normalizeFxPair('SGD', 'HKD');
-    expect(result.base).toBe('SGD');
-    expect(result.quote).toBe('HKD');
-    expect(result.wasInverted).toBe(false);
+    expect(result.base).toBe('HKD');
+    expect(result.quote).toBe('SGD');
+    expect(result.wasInverted).toBe(true);
   });
 });
 
